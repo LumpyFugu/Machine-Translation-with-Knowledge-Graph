@@ -1,0 +1,639 @@
+diff --git a/examples/adaptive_span/truncated_bptt_lm_task.py b/examples/adaptive_span/truncated_bptt_lm_task.py
+deleted file mode 120000
+index a92da3a2..00000000
+--- a/examples/adaptive_span/truncated_bptt_lm_task.py
++++ /dev/null
+@@ -1 +0,0 @@
+-../truncated_bptt/truncated_bptt_lm_task.py
+\ No newline at end of file
+diff --git a/examples/adaptive_span/truncated_bptt_lm_task.py b/examples/adaptive_span/truncated_bptt_lm_task.py
+new file mode 100644
+index 00000000..9978481b
+--- /dev/null
++++ b/examples/adaptive_span/truncated_bptt_lm_task.py
+@@ -0,0 +1,285 @@
++# Copyright (c) Facebook, Inc. and its affiliates.
++#
++# This source code is licensed under the MIT license found in the
++# LICENSE file in the root directory of this source tree.
++
++import logging
++import os
++from dataclasses import dataclass, field
++from typing import List, Optional, Tuple
++
++import torch
++from fairseq import utils
++from fairseq.data import (
++    Dictionary,
++    TokenBlockDataset,
++    data_utils,
++    iterators,
++)
++from fairseq.dataclass import FairseqDataclass
++from fairseq.distributed import utils as dist_utils
++from fairseq.tasks import FairseqTask, register_task
++from omegaconf import II
++
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class TruncatedBPTTLMConfig(FairseqDataclass):
++    data: str = field(default="???", metadata={"help": "path to data directory"})
++    tokens_per_sample: int = field(
++        default=1024, metadata={"help": "max number of tokens per sequence"},
++    )
++    batch_size: int = II("dataset.batch_size")
++    # Some models use *max_target_positions* to know how many positional
++    # embeddings to learn. We use II(...) to make it default to
++    # *tokens_per_sample*, but in principle there could be more positional
++    # embeddings than tokens in a single batch. This may also be irrelevant for
++    # custom model implementations.
++    max_target_positions: int = II("task.tokens_per_sample")
++    # these will be populated automatically if not provided
++    data_parallel_rank: Optional[int] = None
++    data_parallel_size: Optional[int] = None
++
++
++@register_task("truncated_bptt_lm", dataclass=TruncatedBPTTLMConfig)
++class TruncatedBPTTLMTask(FairseqTask):
++    def __init__(self, cfg: TruncatedBPTTLMConfig):
++        super().__init__(cfg)
++
++        if cfg.data_parallel_rank is None or cfg.data_parallel_size is None:
++            if torch.distributed.is_initialized():
++                cfg.data_parallel_rank = dist_utils.get_data_parallel_rank()
++                cfg.data_parallel_size = dist_utils.get_data_parallel_world_size()
++            else:
++                cfg.data_parallel_rank = 0
++                cfg.data_parallel_size = 1
++
++        # load the dictionary
++        paths = utils.split_paths(cfg.data)
++        assert len(paths) > 0
++        self.dictionary = Dictionary.load(os.path.join(paths[0], "dict.txt"))
++        logger.info("dictionary: {} types".format(len(self.dictionary)))
++
++    def load_dataset(self, split, epoch=1, combine=False, **kwargs):
++        """Load a given dataset split (e.g., train, valid, test)"""
++
++        # support sharded datasets
++        paths = utils.split_paths(self.cfg.data)
++        assert len(paths) > 0
++        data_path = paths[(epoch - 1) % len(paths)]
++        split_path = os.path.join(data_path, split)
++
++        # each element of *data* will be a tensorized line from the original
++        # text dataset, similar to ``open(split_path).readlines()``
++        data = data_utils.load_indexed_dataset(
++            split_path, self.dictionary, combine=combine
++        )
++        if data is None:
++            raise FileNotFoundError(
++                "Dataset not found: {} ({})".format(split, split_path)
++            )
++
++        # this is similar to ``data.view(-1).split(tokens_per_sample)``
++        data = TokenBlockDataset(
++            data,
++            data.sizes,
++            block_size=self.cfg.tokens_per_sample,
++            pad=None,  # unused
++            eos=None,  # unused
++            break_mode="none",
++        )
++
++        self.datasets[split] = TruncatedBPTTDataset(
++            data=data,
++            bsz_per_shard=self.cfg.batch_size,
++            shard_id=self.cfg.data_parallel_rank,
++            num_shards=self.cfg.data_parallel_size,
++        )
++
++    def dataset(self, split):
++        return self.datasets[split]
++
++    def get_batch_iterator(
++        self,
++        dataset,
++        num_workers=0,
++        epoch=1,
++        data_buffer_size=0,
++        skip_remainder_batch=False,
++        **kwargs
++    ):
++        return iterators.EpochBatchIterator(
++            dataset=dataset,
++            collate_fn=self._collate_fn,
++            num_workers=num_workers,
++            epoch=epoch,
++            buffer_size=data_buffer_size,
++            # we don't use the batching functionality from EpochBatchIterator;
++            # instead every item in *dataset* is a whole batch
++            batch_sampler=[[i] for i in range(len(dataset))],
++            disable_shuffling=True,
++            skip_remainder_batch=skip_remainder_batch,
++        )
++
++    def _collate_fn(self, items: List[List[torch.Tensor]]):
++        # we don't use fairseq's batching functionality, so we expect a single
++        # Tensor of type List[torch.Tensor]
++        assert len(items) == 1
++
++        # item will have shape B x T (the last batch may have length < T)
++        id, item = items[0]
++        item = data_utils.collate_tokens(item, pad_idx=self.source_dictionary.pad())
++        B, T = item.size()
++
++        # shift item one position over and append a padding token for the target
++        target = torch.nn.functional.pad(
++            item[:, 1:], (0, 1, 0, 0), value=self.target_dictionary.pad()
++        )
++
++        # fairseq expects batches to have the following structure
++        return {
++            "id": torch.tensor([id] * item.size(0)),
++            "net_input": {"src_tokens": item,},
++            "target": target,
++            "nsentences": item.size(0),
++            "ntokens": item.numel(),
++        }
++
++    def build_dataset_for_inference(
++        self, src_tokens: List[torch.Tensor], src_lengths: List[int], **kwargs
++    ) -> torch.utils.data.Dataset:
++        eos = self.source_dictionary.eos()
++        dataset = TokenBlockDataset(
++            src_tokens,
++            src_lengths,
++            block_size=None,  # ignored for "eos" break mode
++            pad=self.source_dictionary.pad(),
++            eos=eos,
++            break_mode="eos",
++        )
++
++        class Dataset(torch.utils.data.Dataset):
++            def __getitem__(self, i):
++                item = dataset[i]
++                if item[-1] == eos:
++                    # remove eos to support generating with a prefix
++                    item = item[:-1]
++                return (i, [item])
++
++            def __len__(self):
++                return len(dataset)
++
++        return Dataset()
++
++    def inference_step(
++        self, generator, models, sample, prefix_tokens=None, constraints=None
++    ):
++        with torch.no_grad():
++            if constraints is not None:
++                raise NotImplementedError
++
++            # SequenceGenerator doesn't use *src_tokens* directly, we need to
++            # pass the *prefix_tokens* argument instead.
++            if prefix_tokens is None and sample["net_input"]["src_tokens"].nelement():
++                prefix_tokens = sample["net_input"]["src_tokens"]
++
++            # begin generation with the end-of-sentence token
++            bos_token = self.source_dictionary.eos()
++
++            return generator.generate(
++                models, sample, prefix_tokens=prefix_tokens, bos_token=bos_token
++            )
++
++    def eval_lm_dataloader(
++        self,
++        dataset,
++        max_tokens: Optional[int] = 36000,
++        batch_size: Optional[int] = None,
++        max_positions: Optional[int] = None,
++        num_shards: int = 1,
++        shard_id: int = 0,
++        num_workers: int = 1,
++        data_buffer_size: int = 10,
++        context_window: int = 0,
++    ):
++        if context_window > 0:
++            raise NotImplementedError(
++                "Transformer-XL doesn't need --context-window, try "
++                "--model-overrides '{\"mem_len\":42}' instead "
++            )
++        return self.get_batch_iterator(
++            dataset=dataset,
++            max_tokens=max_tokens,
++            max_sentences=batch_size,
++            max_positions=max_positions,
++            ignore_invalid_inputs=True,
++            num_shards=num_shards,
++            shard_id=shard_id,
++            num_workers=num_workers,
++            data_buffer_size=data_buffer_size,
++        ).next_epoch_itr(shuffle=False)
++
++    @property
++    def source_dictionary(self):
++        return self.dictionary
++
++    @property
++    def target_dictionary(self):
++        return self.dictionary
++
++
++class TruncatedBPTTDataset(torch.utils.data.Dataset):
++    def __init__(
++        self,
++        data: List[torch.Tensor],  # ordered list of items
++        bsz_per_shard,  # number of items processed per GPUs per forward
++        shard_id,  # current GPU ID
++        num_shards,  # number of GPUs
++    ):
++        super().__init__()
++        self.data = data
++
++        def batchify(data, bsz):
++            # Work out how cleanly we can divide the dataset into bsz parts.
++            nbatch = data.size(0) // bsz
++            # Trim off any extra elements that wouldn't cleanly fit (remainders).
++            data = data.narrow(0, 0, nbatch * bsz)
++            # Evenly divide the data across the bsz batches.
++            data = data.view(bsz, -1).contiguous()
++            return data
++
++        # total number of sequences processed by all GPUs in each forward pass
++        global_batch_size = bsz_per_shard * num_shards
++
++        """
++        With a 16 item dataset, bsz_per_shard=2 and num_shards=3,
++        *indices* might look like:
++
++            indices = [[0, 1],
++                       [2, 3],
++                       [4, 5],
++                       [6, 7],
++                       [8, 9],
++                       [10, 11]]
++
++        The size of the TruncatedBPTTDataset instance will be 2,
++        and shard 1 will see items:
++
++            [(0, [data[4], data[6]]),
++             (1, [data[5], data[7]])]
++        """
++        indices = batchify(torch.arange(len(data)), global_batch_size)
++        assert indices.size(0) == global_batch_size
++
++        self.my_indices = indices[
++            shard_id * bsz_per_shard : (shard_id + 1) * bsz_per_shard
++        ]
++        assert self.my_indices.size(0) == bsz_per_shard
++
++    def __len__(self):
++        return self.my_indices.size(1)
++
++    def __getitem__(self, i) -> Tuple[int, List[torch.Tensor]]:
++        return (i, [self.data[idx] for idx in self.my_indices[:, i]])
+diff --git a/examples/mr_hubert/simple_kmeans b/examples/mr_hubert/simple_kmeans
+deleted file mode 120000
+index 4f955451..00000000
+--- a/examples/mr_hubert/simple_kmeans
++++ /dev/null
+@@ -1 +0,0 @@
+-../hubert/simple_kmeans
+\ No newline at end of file
+diff --git a/examples/pay_less_attention_paper/README.md b/examples/pay_less_attention_paper/README.md
+index 5adab11f..24d3e50a 100644
+--- a/examples/pay_less_attention_paper/README.md
++++ b/examples/pay_less_attention_paper/README.md
+@@ -70,7 +70,7 @@ zh2en = torch.hub.load('pytorch/fairseq', 'lightconv.glu.wmt17.zh-en', tokenizer
+ assert isinstance(zh2en.models[0], fairseq.models.lightconv.LightConvModel)
+ 
+ # Translate a sentence
+-zh2en.translate('你好 世界')
++zh2en.translate('Hello world')
+ # 'Hello World'
+ ```
+ 
+diff --git a/examples/translation/README.md b/examples/translation/README.md
+index 2941f5eb..14599479 100644
+--- a/examples/translation/README.md
++++ b/examples/translation/README.md
+@@ -63,7 +63,7 @@ zh2en = TransformerModel.from_pretrained(
+   bpe='subword_nmt',
+   bpe_codes='data-bin/wmt17_zh_en_full/zh.code'
+ )
+-zh2en.translate('你好 世界')
++zh2en.translate('Hello world')
+ # 'Hello World'
+ ```
+ 
+diff --git a/examples/wav2vec/unsupervised/kaldi_self_train/st/steps b/examples/wav2vec/unsupervised/kaldi_self_train/st/steps
+deleted file mode 120000
+index 6e99bf5b..00000000
+--- a/examples/wav2vec/unsupervised/kaldi_self_train/st/steps
++++ /dev/null
+@@ -1 +0,0 @@
+-../../wsj/s5/steps
+\ No newline at end of file
+diff --git a/examples/wav2vec/unsupervised/kaldi_self_train/st/utils b/examples/wav2vec/unsupervised/kaldi_self_train/st/utils
+deleted file mode 120000
+index b2408852..00000000
+--- a/examples/wav2vec/unsupervised/kaldi_self_train/st/utils
++++ /dev/null
+@@ -1 +0,0 @@
+-../../wsj/s5/utils
+\ No newline at end of file
+diff --git a/examples/xglm/README.md b/examples/xglm/README.md
+index 914e2976..891fde9c 100644
+--- a/examples/xglm/README.md
++++ b/examples/xglm/README.md
+@@ -70,16 +70,16 @@ data_samples = {
+     ],
+     'zh': [
+         {
+-            "premise": "我想节约能源。", 
+-            "choice1": "我在空着的房间里扫了地板。", 
+-            "choice2": "我把空房间里的灯关了。",
++            "premise": "I want to save energy.", 
++            "choice1": "I swept the floor in an empty room.", 
++            "choice2": "I turned off the light in the empty room.",
+             "question": "effect",
+             "label": "1"
+         },
+         {
+-            "premise": "蜡烛上的火焰熄灭了。",
+-            "choice1": "我吹灭了灯芯。", 
+-            "choice2": "我把一根火柴放在灯芯上。",
++            "premise": "The candle flame went out.",
++            "choice1": "I blew out the wick.", 
++            "choice2": "I put a match to the wick.",
+             "question": "cause",
+             "label": "0"
+         }
+diff --git a/examples/xlmr/README.md b/examples/xlmr/README.md
+index bba7910e..1215e233 100644
+--- a/examples/xlmr/README.md
++++ b/examples/xlmr/README.md
+@@ -93,9 +93,9 @@ en_tokens = xlmr.encode('Hello world!')
+ assert en_tokens.tolist() == [0, 35378,  8999, 38, 2]
+ xlmr.decode(en_tokens)  # 'Hello world!'
+ 
+-zh_tokens = xlmr.encode('你好，世界')
++zh_tokens = xlmr.encode('Hello, world')
+ assert zh_tokens.tolist() == [0, 6, 124084, 4, 3221, 2]
+-xlmr.decode(zh_tokens)  # '你好，世界'
++xlmr.decode(zh_tokens)  # 'Hello, world'
+ 
+ hi_tokens = xlmr.encode('नमस्ते दुनिया')
+ assert hi_tokens.tolist() == [0, 68700, 97883, 29405, 2]
+diff --git a/fairseq/models/transformer/transformer_encoder.py b/fairseq/models/transformer/transformer_encoder.py
+index a684fcb4..a974c886 100644
+--- a/fairseq/models/transformer/transformer_encoder.py
++++ b/fairseq/models/transformer/transformer_encoder.py
+@@ -10,8 +10,10 @@ import torch
+ import torch.nn as nn
+ from torch import Tensor
+ 
++import logging
+ from fairseq import utils
+ from fairseq.distributed import fsdp_wrap
++from fairseq.distributed import utils as distributed_utils
+ from fairseq.models import FairseqEncoder
+ from fairseq.models.transformer import TransformerConfig
+ from fairseq.modules import (
+@@ -26,6 +28,8 @@ from fairseq.modules.checkpoint_activations import checkpoint_wrapper
+ from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
+ 
+ 
++logger = logging.getLogger(__name__)
++
+ # rewrite name for backward compatibility in `make_generation_fast_`
+ def module_name_fordropout(module_name: str) -> str:
+     if module_name == "TransformerEncoderBase":
+@@ -102,6 +106,16 @@ class TransformerEncoderBase(FairseqEncoder):
+         else:
+             self.layer_norm = None
+ 
++        # KG projection layer
++        self.use_kg_embedding = getattr(cfg, "use_kg_embedding", False)
++        kg_dim = getattr(cfg, "kg_embed_dim", embed_dim)
++
++        # Build projection whenever dims mismatch, regardless of use_kg_embedding
++        if kg_dim != embed_dim:
++            self.kg_proj = nn.Linear(kg_dim, embed_dim, bias=False)
++        else:
++            self.kg_proj = None
++
+     def build_encoder_layer(self, cfg):
+         layer = transformer_layer.TransformerEncoderLayerBase(
+             cfg, return_fc=self.return_fc
+@@ -117,120 +131,98 @@ class TransformerEncoderBase(FairseqEncoder):
+         return layer
+ 
+     def forward_embedding(
+-        self, src_tokens, token_embedding: Optional[torch.Tensor] = None
++        self,
++        src_tokens,
++        token_embedding: Optional[torch.Tensor] = None,
++        kg_embedding: Optional[torch.Tensor] = None,
+     ):
+-        # embed tokens and positions
+-        if token_embedding is None:
+-            token_embedding = self.embed_tokens(src_tokens)
+-        x = embed = self.embed_scale * token_embedding
++        """
++        KG-only encoder input: x = Proj(KG) + pos_embed (no longer adding token embeddings)
++        """
++        if kg_embedding is None:
++            # fall back to using the attached KG table if present (generation path)
++            if getattr(self, "kg_table", None) is not None:
++                B, T = src_tokens.size()
++                kg_tbl = self.kg_table.to(device=src_tokens.device)
++                kg_tbl = kg_tbl.to(dtype=self.embed_tokens.weight.dtype)
++                kg_embedding = kg_tbl.index_select(0, src_tokens.view(-1)).view(B, T, -1)
++            else:
++                raise RuntimeError("KG-only mode: kg_embedding is required")
++
++        kg_feat = kg_embedding
++        if self.kg_proj is not None:
++            kg_feat = self.kg_proj(kg_feat)
++
++        kg_feat = kg_feat.to(dtype=self.embed_tokens.weight.dtype, device=src_tokens.device)
++
++        x = kg_feat
++
+         if self.embed_positions is not None:
+-            x = embed + self.embed_positions(src_tokens)
++            x = x + self.embed_positions(src_tokens)
++
+         if self.layernorm_embedding is not None:
+             x = self.layernorm_embedding(x)
++
+         x = self.dropout_module(x)
+         if self.quant_noise is not None:
+             x = self.quant_noise(x)
++
++        embed = kg_feat
+         return x, embed
+ 
++
+     def forward(
+         self,
+         src_tokens,
+         src_lengths: Optional[torch.Tensor] = None,
+         return_all_hiddens: bool = False,
+         token_embeddings: Optional[torch.Tensor] = None,
++        **kwargs,
+     ):
+-        """
+-        Args:
+-            src_tokens (LongTensor): tokens in the source language of shape
+-                `(batch, src_len)`
+-            src_lengths (torch.LongTensor): lengths of each source sentence of
+-                shape `(batch)`
+-            return_all_hiddens (bool, optional): also return all of the
+-                intermediate hidden states (default: False).
+-            token_embeddings (torch.Tensor, optional): precomputed embeddings
+-                default `None` will recompute embeddings
++        kg_embedding = kwargs.get("kg_embedding", None)
+ 
+-        Returns:
+-            dict:
+-                - **encoder_out** (Tensor): the last encoder layer's output of
+-                  shape `(src_len, batch, embed_dim)`
+-                - **encoder_padding_mask** (ByteTensor): the positions of
+-                  padding elements of shape `(batch, src_len)`
+-                - **encoder_embedding** (Tensor): the (scaled) embedding lookup
+-                  of shape `(batch, src_len, embed_dim)`
+-                - **encoder_states** (List[Tensor]): all intermediate
+-                  hidden states of shape `(src_len, batch, embed_dim)`.
+-                  Only populated if *return_all_hiddens* is True.
+-        """
+         return self.forward_scriptable(
+-            src_tokens, src_lengths, return_all_hiddens, token_embeddings
++            src_tokens,
++            src_lengths=src_lengths,
++            return_all_hiddens=return_all_hiddens,
++            token_embeddings=token_embeddings,
++            kg_embedding=kg_embedding,
+         )
+ 
+-    # TorchScript doesn't support super() method so that the scriptable Subclass
+-    # can't access the base class model in Torchscript.
+-    # Current workaround is to add a helper function with different name and
+-    # call the helper function from scriptable Subclass.
++
+     def forward_scriptable(
+         self,
+         src_tokens,
+         src_lengths: Optional[torch.Tensor] = None,
+         return_all_hiddens: bool = False,
+         token_embeddings: Optional[torch.Tensor] = None,
++        kg_embedding: Optional[torch.Tensor] = None,
+     ):
+-        """
+-        Args:
+-            src_tokens (LongTensor): tokens in the source language of shape
+-                `(batch, src_len)`
+-            src_lengths (torch.LongTensor): lengths of each source sentence of
+-                shape `(batch)`
+-            return_all_hiddens (bool, optional): also return all of the
+-                intermediate hidden states (default: False).
+-            token_embeddings (torch.Tensor, optional): precomputed embeddings
+-                default `None` will recompute embeddings
+-
+-        Returns:
+-            dict:
+-                - **encoder_out** (Tensor): the last encoder layer's output of
+-                  shape `(src_len, batch, embed_dim)`
+-                - **encoder_padding_mask** (ByteTensor): the positions of
+-                  padding elements of shape `(batch, src_len)`
+-                - **encoder_embedding** (Tensor): the (scaled) embedding lookup
+-                  of shape `(batch, src_len, embed_dim)`
+-                - **encoder_states** (List[Tensor]): all intermediate
+-                  hidden states of shape `(src_len, batch, embed_dim)`.
+-                  Only populated if *return_all_hiddens* is True.
+-        """
+         # compute padding mask
+         encoder_padding_mask = src_tokens.eq(self.padding_idx)
+-        has_pads = (
+-            torch.tensor(src_tokens.device.type == "xla") or encoder_padding_mask.any()
+-        )
+-        # Torchscript doesn't handle bool Tensor correctly, so we need to work around.
++        has_pads = (torch.tensor(src_tokens.device.type == "xla") or encoder_padding_mask.any())
+         if torch.jit.is_scripting():
+             has_pads = torch.tensor(1) if has_pads else torch.tensor(0)
+ 
+-        x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
+-
+-        # account for padding while computing the representation
+-        x = x * (
+-            1 - encoder_padding_mask.unsqueeze(-1).type_as(x) * has_pads.type_as(x)
++        x, encoder_embedding = self.forward_embedding(
++            src_tokens,
++            token_embeddings,
++            kg_embedding=kg_embedding,
+         )
+ 
++        # account for padding
++        x = x * (1 - encoder_padding_mask.unsqueeze(-1).type_as(x) * has_pads.type_as(x))
++
+         # B x T x C -> T x B x C
+         x = x.transpose(0, 1)
+ 
+         encoder_states = []
+         fc_results = []
+-
+         if return_all_hiddens:
+             encoder_states.append(x)
+ 
+-        # encoder layers
+         for layer in self.layers:
+-            lr = layer(
+-                x, encoder_padding_mask=encoder_padding_mask if has_pads else None
+-            )
+-
++            lr = layer(x, encoder_padding_mask=encoder_padding_mask if has_pads else None)
+             if isinstance(lr, tuple) and len(lr) == 2:
+                 x, fc_result = lr
+             else:
+@@ -238,29 +230,25 @@ class TransformerEncoderBase(FairseqEncoder):
+                 fc_result = None
+ 
+             if return_all_hiddens and not torch.jit.is_scripting():
+-                assert encoder_states is not None
+                 encoder_states.append(x)
+                 fc_results.append(fc_result)
+ 
+         if self.layer_norm is not None:
+             x = self.layer_norm(x)
+ 
+-        # The Pytorch Mobile lite interpreter does not supports returning NamedTuple in
+-        # `forward` so we use a dictionary instead.
+-        # TorchScript does not support mixed values so the values are all lists.
+-        # The empty list is equivalent to None.
+         src_lengths = (
+             src_tokens.ne(self.padding_idx)
+             .sum(dim=1, dtype=torch.int32)
+             .reshape(-1, 1)
+             .contiguous()
+         )
++
+         return {
+-            "encoder_out": [x],  # T x B x C
+-            "encoder_padding_mask": [encoder_padding_mask],  # B x T
+-            "encoder_embedding": [encoder_embedding],  # B x T x C
+-            "encoder_states": encoder_states,  # List[T x B x C]
+-            "fc_results": fc_results,  # List[T x B x C]
++            "encoder_out": [x],
++            "encoder_padding_mask": [encoder_padding_mask],
++            "encoder_embedding": [encoder_embedding],
++            "encoder_states": encoder_states,
++            "fc_results": fc_results,
+             "src_tokens": [],
+             "src_lengths": [src_lengths],
+         }
