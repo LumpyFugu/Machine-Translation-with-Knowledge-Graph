@@ -20,17 +20,17 @@ experiment_6_earliest_test: Ablation experiment
 
 ## 1. Directory Structure
 
-### `preprocess/`
+### `preprocess`
 Scripts and utilities for data preprocessing
 
-### `experiment/`
+### `experiment`
 Contains:
 - All experimental scripts
 - Model modifications from the original source code of *"End-to-end Entity-aware Neural Machine Translation (Xie et al., 2022)"* , link: https://www.dropbox.com/s/1owvyh6w0ahu8k4/entity_nmt.zip?dl=0
 - Training configurations
 - Evaluation procedures used in this research
 
-### `conda_environment/`
+### `conda_environment`
 Contains exported conda environment files (`.yml`) used for reproducibility.
 
 ---
