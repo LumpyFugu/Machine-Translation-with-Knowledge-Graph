@@ -26,7 +26,7 @@ Scripts and utilities for data preprocessing
 ### `experiment/`
 Contains:
 - All experimental scripts
-- Model modifications from the original source code of *"End-to-end Entity-aware Neural Machine Translation (Xie et al., 2022)"* , link: https:// www. dropb ox. com/s/ 1owvy h6w0a hu8k4/ entity_ nmt. zip?dl=0
+- Model modifications from the original source code of *"End-to-end Entity-aware Neural Machine Translation (Xie et al., 2022)"* , link: https://www.dropbox.com/s/1owvyh6w0ahu8k4/entity_nmt.zip?dl=0
 - Training configurations
 - Evaluation procedures used in this research
 
