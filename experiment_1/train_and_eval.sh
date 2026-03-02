@@ -1,16 +1,10 @@
 # Please run the following commands under the `fairseq12` conda environment.
-#!/usr/bin/env bash
 set -euo pipefail
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 
 # Training (with BLEU on valid and best-checkpoint saving)
 # Final test-set evaluation (fairseq-generate -> sacrebleu for BLEU/chrF)
 
-
-########################
-# Paths & hyperparameters (edit as needed)
-########################
-# Your custom module (user-dir)
 USER_DIR="/home/etlpro/XIXI/experiment/experiment_1/src"
 DATA=/home/etlpro/XIXI/data/data-bin
 SAVE=/home/etlpro/XIXI/experiment/experiment_1/log
@@ -19,7 +13,6 @@ TGT=zh
 TB=$SAVE/tb
 
 # Runtime outputs (generation/evaluation intermediates)
-#RUN_DIR="$SAVE/run_20260103_170237"
 RUN_DIR="${SAVE}/run_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_DIR"
 LOG=$RUN_DIR/train.log
@@ -60,12 +53,6 @@ fairseq-train "$DATA" \
   --best-checkpoint-metric loss \
   --save-dir "$RUN_DIR" \
   2>&1 | tee -a "$LOG"
-
- #--eval-bleu \
- #--eval-bleu-detok sentencepiece \
- #--eval-bleu-remove-bpe \
- #--eval-bleu-print-samples \
- # --maximize-best-checkpoint-metric \
   
 
 ########################
@@ -83,15 +70,6 @@ fairseq-generate "$DATA" \
   --scoring sacrebleu \
   > "$RUN_DIR/gen.out"
 
-#CUDA_VISIBLE_DEVICES= python /home/etlpro/XIXI/xyc.1/entity_nmt/cli/generate_mode1.py \
-#  "$DATA" --user-dir "$USER_DIR" \
-#  --task entity_translation --mode 1 \
-#  --path "$RUN_DIR/checkpoint_best.pt" \
-#  --source-lang "$SRC" --target-lang "$TGT" \
-#  --beam 5 --batch-size 1 \
-#  --remove-bpe=sentencepiece --scoring sacrebleu \
-#  --max-sentences 1 --cpu
-
 ########################
 # Extract system outputs and references
 ########################
@@ -103,7 +81,6 @@ grep -P "^T-" "$RUN_DIR/gen.out" | sort -V | cut -f2- > "$RUN_DIR/ref.$TGT"
 ########################
 # Compute BLEU (sacrebleu)
 ########################
-# For Chinese, -tok zh is recommended; if missing: pip install sacrebleu
 if command -v sacrebleu >/dev/null 2>&1; then
   sacrebleu -tok zh "$RUN_DIR/ref.$TGT" < "$RUN_DIR/sys.$TGT" | tee "$RUN_DIR/bleu.txt"
 else
